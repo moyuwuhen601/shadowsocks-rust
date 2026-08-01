@@ -2,6 +2,8 @@ name: ShellCheck
 
 on:
   push:
+    branches:
+      - main
     paths:
       - "**.sh"
       - ".github/workflows/shellcheck.yml"
@@ -27,7 +29,10 @@ jobs:
           sudo apt-get install --yes shellcheck
 
       - name: Check Bash syntax
-        run: bash -n shadowsocks-rust.sh
+        run: bash -n shadowsocks-rust.sh tests/run.sh
 
       - name: Run ShellCheck
-        run: shellcheck -x shadowsocks-rust.sh
+        run: shellcheck -x shadowsocks-rust.sh tests/run.sh
+
+      - name: Run functional tests
+        run: bash tests/run.sh
