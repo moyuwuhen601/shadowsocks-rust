@@ -11,13 +11,25 @@
 set -o pipefail
 
 # --- 基础设置 ---
-VERSION="2.1.0"
-CONFIG_FILE="/etc/shadowsocks-rust/config.json"
-REMARKS_FILE="/etc/shadowsocks-rust/remarks"
+VERSION="2.2.0"
+CONFIG_DIR="/etc/shadowsocks-rust"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+REMARKS_FILE="$CONFIG_DIR/remarks"
 SERVICE_FILE="/etc/systemd/system/shadowsocks-rust.service"
 BIN_PATH="/usr/local/bin/ssserver"
 SERVICE_USER="shadowsocks-rust"
+SERVICE_GROUP="shadowsocks-rust"
+STATE_DIR="/var/lib/shadowsocks-rust"
+MANAGED_USER_MARKER="$STATE_DIR/managed-user"
+MANAGED_GROUP_MARKER="$STATE_DIR/managed-group"
+CORE_BACKUP_PATH="${BIN_PATH}.previous"
 TMP_DIR=""
+CONFIG_TXN_DIR=""
+CONFIG_TXN_ACTIVE=0
+CONFIG_SERVICE_WAS_ACTIVE=0
+CONFIG_SERVICE_WAS_ENABLED=0
+CORE_INSTALLED_THIS_RUN=0
+CORE_HAD_PREVIOUS=0
 
 # --- 颜色定义 ---
 RED="\033[31m"
@@ -40,19 +52,42 @@ cleanup() {
         rm -rf -- "$TMP_DIR"
     fi
 }
-trap cleanup EXIT
-trap 'exit 130' INT TERM
 
-# --- 检查 Root ---
-if [[ $EUID -ne 0 ]]; then
-    print_err "必须使用 root 用户运行此脚本！"
-    exit 1
-fi
+handle_exit() {
+    if (( CONFIG_TXN_ACTIVE )); then
+        rollback_config_transaction >/dev/null 2>&1 || true
+    elif (( CORE_INSTALLED_THIS_RUN )); then
+        rollback_core_update >/dev/null 2>&1 || true
+    fi
+    cleanup
+}
 
-if ! command -v systemctl >/dev/null 2>&1; then
-    print_err "当前系统未使用 systemd，无法安装本服务。"
-    exit 1
-fi
+prompt_input() {
+    local target=$1 prompt=$2
+
+    if ! IFS= read -r -p "$prompt" "${target?}"; then
+        echo ""
+        print_warn "输入已中断，本次操作已取消。"
+        return 1
+    fi
+}
+
+preflight() {
+    if [[ $EUID -ne 0 ]]; then
+        print_err "必须使用 root 用户运行此脚本！"
+        return 1
+    fi
+    if [[ ! -t 0 ]]; then
+        print_err "这是交互式脚本，请在终端中直接运行，不要通过管道执行。"
+        return 1
+    fi
+    if ! command -v systemctl >/dev/null 2>&1 || \
+        [[ ! -d /run/systemd/system ]] || \
+        ! systemctl show --property=Version --value >/dev/null 2>&1; then
+        print_err "当前环境没有正在运行的 systemd，无法安装本服务。"
+        return 1
+    fi
+}
 
 # --- 获取系统架构 ---
 check_arch() {
@@ -127,7 +162,33 @@ install_deps() {
     print_ok "依赖安装完成"
 }
 
-# --- 安装/更新内核 ---
+# --- 内核事务与安装/更新 ---
+commit_core_update() {
+    rm -f "$CORE_BACKUP_PATH"
+    CORE_INSTALLED_THIS_RUN=0
+    CORE_HAD_PREVIOUS=0
+}
+
+rollback_core_update() {
+    if (( ! CORE_INSTALLED_THIS_RUN )); then
+        return 0
+    fi
+
+    if (( CORE_HAD_PREVIOUS )) && [[ -f "$CORE_BACKUP_PATH" ]]; then
+        if ! mv -f "$CORE_BACKUP_PATH" "$BIN_PATH"; then
+            print_err "旧内核自动回滚失败：$CORE_BACKUP_PATH"
+            return 1
+        fi
+        print_warn "已自动恢复更新前的 ssserver。"
+    else
+        rm -f "$BIN_PATH" "$CORE_BACKUP_PATH"
+        print_warn "已移除本次未能正常启用的 ssserver。"
+    fi
+
+    CORE_INSTALLED_THIS_RUN=0
+    CORE_HAD_PREVIOUS=0
+}
+
 install_core() {
     local release_json tag asset_name asset_url checksum_url
     local archive checksum_file extract_dir expected_sha actual_version
@@ -206,14 +267,31 @@ install_core() {
         return 1
     fi
 
-    # 在目标目录内原子替换，更新失败时不会破坏原有可执行文件。
-    install -d -m 0755 "$(dirname "$BIN_PATH")"
+    # 在目标目录内原子替换，并保留可自动回滚的上一个版本。
+    if ! install -d -m 0755 "$(dirname "$BIN_PATH")"; then
+        print_err "无法创建内核安装目录。"
+        return 1
+    fi
+    rm -f "$CORE_BACKUP_PATH"
+    CORE_HAD_PREVIOUS=0
+    if [[ -f "$BIN_PATH" ]]; then
+        if ! cp -p "$BIN_PATH" "$CORE_BACKUP_PATH"; then
+            print_err "无法备份当前 ssserver，已取消更新。"
+            return 1
+        fi
+        CORE_HAD_PREVIOUS=1
+    fi
     if ! install -m 0755 "$extract_dir/ssserver" "${BIN_PATH}.new" || \
         ! mv -f "${BIN_PATH}.new" "$BIN_PATH"; then
         rm -f "${BIN_PATH}.new"
         print_err "无法安装 ssserver 到 $BIN_PATH。"
+        if (( CORE_HAD_PREVIOUS )); then
+            mv -f "$CORE_BACKUP_PATH" "$BIN_PATH" || true
+        fi
+        CORE_HAD_PREVIOUS=0
         return 1
     fi
+    CORE_INSTALLED_THIS_RUN=1
 
     cleanup
     TMP_DIR=""
@@ -224,17 +302,64 @@ install_core() {
 ensure_service_user() {
     local nologin_shell
 
-    if id "$SERVICE_USER" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    nologin_shell=$(command -v nologin || true)
-    [[ -z "$nologin_shell" ]] && nologin_shell="/usr/sbin/nologin"
-    if ! useradd --system --user-group --home-dir /nonexistent \
-        --shell "$nologin_shell" "$SERVICE_USER"; then
-        print_err "无法创建低权限服务账户 $SERVICE_USER。"
+    if ! command -v getent >/dev/null 2>&1 || \
+        ! command -v groupadd >/dev/null 2>&1 || \
+        ! command -v useradd >/dev/null 2>&1; then
+        print_err "系统缺少 getent、groupadd 或 useradd，无法创建服务账户。"
         return 1
     fi
+    if ! install -d -m 0700 -o root -g root "$STATE_DIR"; then
+        print_err "无法创建状态目录：$STATE_DIR"
+        return 1
+    fi
+
+    if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+        if ! groupadd --system "$SERVICE_GROUP"; then
+            print_err "无法创建低权限服务组 $SERVICE_GROUP。"
+            return 1
+        fi
+        if ! install -m 0600 /dev/null "$MANAGED_GROUP_MARKER"; then
+            groupdel "$SERVICE_GROUP" 2>/dev/null || true
+            print_err "无法记录服务组的创建状态。"
+            return 1
+        fi
+    fi
+
+    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+        nologin_shell=$(command -v nologin || true)
+        [[ -z "$nologin_shell" ]] && nologin_shell="/usr/sbin/nologin"
+        if ! useradd --system --gid "$SERVICE_GROUP" --no-create-home \
+            --home-dir /nonexistent --shell "$nologin_shell" "$SERVICE_USER"; then
+            print_err "无法创建低权限服务账户 $SERVICE_USER。"
+            return 1
+        fi
+        if ! install -m 0600 /dev/null "$MANAGED_USER_MARKER"; then
+            userdel "$SERVICE_USER" 2>/dev/null || true
+            print_err "无法记录服务账户的创建状态。"
+            return 1
+        fi
+    fi
+}
+
+remove_managed_service_identity() {
+    local failed=0
+
+    if [[ -f "$MANAGED_USER_MARKER" ]] && id "$SERVICE_USER" >/dev/null 2>&1; then
+        if ! userdel "$SERVICE_USER" 2>/dev/null; then
+            print_warn "服务账户 $SERVICE_USER 删除失败，已保留状态标记。"
+            failed=1
+        fi
+    fi
+    if [[ -f "$MANAGED_GROUP_MARKER" ]] && getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+        if ! groupdel "$SERVICE_GROUP" 2>/dev/null; then
+            print_warn "服务组 $SERVICE_GROUP 删除失败，已保留状态标记。"
+            failed=1
+        fi
+    fi
+    if (( ! failed )); then
+        rm -rf "$STATE_DIR"
+    fi
+    return "$failed"
 }
 
 validate_2022_password() {
@@ -261,7 +386,7 @@ After=network-online.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-Group=$SERVICE_USER
+Group=$SERVICE_GROUP
 ExecStartPre=/usr/bin/test -x $BIN_PATH
 ExecStartPre=/usr/bin/test -r $CONFIG_FILE
 ExecStart=$BIN_PATH -c $CONFIG_FILE
@@ -298,6 +423,144 @@ EOF
     rm -f "$service_tmp"
 }
 
+begin_config_transaction() {
+    local snapshot_failed=0
+
+    CONFIG_TXN_DIR=$(mktemp -d /tmp/shadowsocks-rust-config.XXXXXX) || {
+        print_err "无法创建配置事务目录。"
+        return 1
+    }
+    chmod 700 "$CONFIG_TXN_DIR" || snapshot_failed=1
+    CONFIG_SERVICE_WAS_ACTIVE=0
+    CONFIG_SERVICE_WAS_ENABLED=0
+    systemctl is-active --quiet shadowsocks-rust && CONFIG_SERVICE_WAS_ACTIVE=1
+    systemctl is-enabled --quiet shadowsocks-rust && CONFIG_SERVICE_WAS_ENABLED=1
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        install -m 0600 /dev/null "$CONFIG_TXN_DIR/config-dir-existed" || snapshot_failed=1
+        stat -c '%u %g %a' "$CONFIG_DIR" > "$CONFIG_TXN_DIR/config-dir.meta" || snapshot_failed=1
+    fi
+    if [[ -e "$CONFIG_FILE" ]]; then
+        cp -a "$CONFIG_FILE" "$CONFIG_TXN_DIR/config.json" || snapshot_failed=1
+        install -m 0600 /dev/null "$CONFIG_TXN_DIR/config-existed" || snapshot_failed=1
+    fi
+    if [[ -e "$REMARKS_FILE" ]]; then
+        cp -a "$REMARKS_FILE" "$CONFIG_TXN_DIR/remarks" || snapshot_failed=1
+        install -m 0600 /dev/null "$CONFIG_TXN_DIR/remarks-existed" || snapshot_failed=1
+    fi
+    if [[ -e "$SERVICE_FILE" ]]; then
+        cp -a "$SERVICE_FILE" "$CONFIG_TXN_DIR/service" || snapshot_failed=1
+        install -m 0600 /dev/null "$CONFIG_TXN_DIR/service-existed" || snapshot_failed=1
+    fi
+    if (( snapshot_failed )); then
+        rm -rf -- "$CONFIG_TXN_DIR"
+        CONFIG_TXN_DIR=""
+        print_err "无法完整备份当前配置，已取消操作。"
+        return 1
+    fi
+    CONFIG_TXN_ACTIVE=1
+}
+
+restore_transaction_file() {
+    local existed_marker=$1 backup=$2 destination=$3
+
+    if [[ -f "$existed_marker" ]]; then
+        cp -a "$backup" "$destination"
+    else
+        rm -f "$destination"
+    fi
+}
+
+commit_config_transaction() {
+    if [[ -n "$CONFIG_TXN_DIR" && -d "$CONFIG_TXN_DIR" ]]; then
+        rm -rf -- "$CONFIG_TXN_DIR"
+    fi
+    CONFIG_TXN_DIR=""
+    CONFIG_TXN_ACTIVE=0
+}
+
+rollback_config_transaction() {
+    local restore_failed=0 dir_uid dir_gid dir_mode
+
+    (( CONFIG_TXN_ACTIVE )) || return 0
+    rollback_core_update || restore_failed=1
+    restore_transaction_file "$CONFIG_TXN_DIR/config-existed" \
+        "$CONFIG_TXN_DIR/config.json" "$CONFIG_FILE" || restore_failed=1
+    restore_transaction_file "$CONFIG_TXN_DIR/remarks-existed" \
+        "$CONFIG_TXN_DIR/remarks" "$REMARKS_FILE" || restore_failed=1
+    restore_transaction_file "$CONFIG_TXN_DIR/service-existed" \
+        "$CONFIG_TXN_DIR/service" "$SERVICE_FILE" || restore_failed=1
+
+    if [[ ! -f "$CONFIG_TXN_DIR/config-dir-existed" ]]; then
+        rmdir "$CONFIG_DIR" 2>/dev/null || true
+    elif read -r dir_uid dir_gid dir_mode < "$CONFIG_TXN_DIR/config-dir.meta"; then
+        chown "$dir_uid:$dir_gid" "$CONFIG_DIR" || restore_failed=1
+        chmod "$dir_mode" "$CONFIG_DIR" || restore_failed=1
+    else
+        restore_failed=1
+    fi
+
+    CONFIG_TXN_ACTIVE=0
+    systemctl daemon-reload >/dev/null 2>&1 || restore_failed=1
+    if (( CONFIG_SERVICE_WAS_ENABLED )); then
+        systemctl enable shadowsocks-rust >/dev/null 2>&1 || restore_failed=1
+    else
+        systemctl disable shadowsocks-rust >/dev/null 2>&1 || true
+    fi
+    systemctl reset-failed shadowsocks-rust 2>/dev/null || true
+    if (( CONFIG_SERVICE_WAS_ACTIVE )); then
+        systemctl restart shadowsocks-rust >/dev/null 2>&1 || restore_failed=1
+    else
+        systemctl stop shadowsocks-rust >/dev/null 2>&1 || true
+    fi
+
+    commit_config_transaction
+    if (( restore_failed )); then
+        print_err "自动回滚未完全成功，请检查服务和备份状态。"
+        return 1
+    fi
+    print_warn "配置、服务文件和内核已恢复到操作前状态。"
+}
+
+check_service_health() {
+    local port mode main_pid
+
+    for _ in 1 2; do
+        sleep 1
+        if ! systemctl is-active --quiet shadowsocks-rust; then
+            print_err "服务在启动后退出。"
+            return 1
+        fi
+    done
+
+    if ! command -v lsof >/dev/null 2>&1 || [[ ! -f "$CONFIG_FILE" ]]; then
+        print_warn "无法进行端口级健康检查，仅确认了 systemd 活跃状态。"
+        return 0
+    fi
+    if ! port=$(jq -er '.server_port' "$CONFIG_FILE" 2>/dev/null); then
+        print_warn "检测到扩展或自定义配置，已跳过单端口监听检查。"
+        return 0
+    fi
+    mode=$(jq -r '.mode // "tcp_only"' "$CONFIG_FILE" 2>/dev/null)
+    main_pid=$(systemctl show --property=MainPID --value shadowsocks-rust 2>/dev/null)
+    if [[ ! "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        print_err "无法取得 ssserver 的 MainPID。"
+        return 1
+    fi
+
+    if [[ "$mode" != "udp_only" ]] && \
+        ! lsof -nP -a -p "$main_pid" -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        print_err "ssserver 未监听 TCP 端口 $port。"
+        return 1
+    fi
+    if [[ "$mode" != "tcp_only" ]] && \
+        ! lsof -nP -a -p "$main_pid" -iUDP:"$port" >/dev/null 2>&1; then
+        print_err "ssserver 未监听 UDP 端口 $port。"
+        return 1
+    fi
+    print_ok "健康检查通过：systemd 稳定，端口 $port 与配置一致。"
+}
+
 # --- 配置 SS ---
 configure_ss() {
     local current_port="" config_tmp listen_addr="::"
@@ -321,7 +584,7 @@ configure_ss() {
     
     # 1. 端口设置与检测
     while true; do
-        IFS= read -r -p "请输入端口 [留空随机 10000-65535]: " PORT
+        prompt_input PORT "请输入端口 [留空随机 10000-65535]: " || return 130
         [[ -z "$PORT" ]] && PORT=$(shuf -i 10000-65535 -n 1)
 
         if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then
@@ -350,7 +613,7 @@ configure_ss() {
     echo " 2) chacha20-ietf-poly1305 (移动端/ARM友好)"
     echo " 3) 2022-blake3-aes-256-gcm (新协议/防探测)"
     echo " 4) 2022-blake3-chacha20-poly1305 (新协议/高性能)"
-    IFS= read -r -p "请选择 [默认 1]: " METHOD_OPT
+    prompt_input METHOD_OPT "请选择 [默认 1]: " || return 130
     
     case $METHOD_OPT in
         2) METHOD="chacha20-ietf-poly1305"; PW_LEN=32 ;;
@@ -361,7 +624,7 @@ configure_ss() {
     echo -e "加密: ${GREEN}$METHOD${PLAIN}"
 
     # 3. 密码生成 (智能适配)
-    IFS= read -r -p "请输入密码 [留空自动生成强密码]: " PASSWORD
+    prompt_input PASSWORD "请输入密码 [留空自动生成强密码]: " || return 130
     if [[ -z "$PASSWORD" ]]; then
         PASSWORD=$(openssl rand -base64 "$PW_LEN" | tr -d '\n')
         echo -e "密码: ${GREEN}已自动生成符合协议要求的密钥${PLAIN}"
@@ -372,16 +635,19 @@ configure_ss() {
     fi
 
     # 4. 备注
-    IFS= read -r -p "请输入备注名 [默认 SS-Rust]: " REMARKS
+    prompt_input REMARKS "请输入备注名 [默认 SS-Rust]: " || return 130
     [[ -z "$REMARKS" ]] && REMARKS="SS-Rust"
 
     # 5. 写入配置
-    if ! install -d -m 0750 -o root -g "$SERVICE_USER" /etc/shadowsocks-rust; then
+    begin_config_transaction || return 1
+    if ! install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"; then
         print_err "无法创建配置目录。"
+        rollback_config_transaction || true
         return 1
     fi
     config_tmp=$(mktemp) || {
         print_err "无法创建临时配置文件。"
+        rollback_config_transaction || true
         return 1
     }
     if ! jq -n \
@@ -392,32 +658,37 @@ configure_ss() {
         '{server: $server, server_port: $server_port, password: $password,
           method: $method, mode: "tcp_and_udp", fast_open: true, timeout: 300}' \
         > "$config_tmp" || \
-        ! install -m 0640 -o root -g "$SERVICE_USER" "$config_tmp" "$CONFIG_FILE"; then
+        ! install -m 0640 -o root -g "$SERVICE_GROUP" "$config_tmp" "$CONFIG_FILE"; then
         rm -f "$config_tmp"
         print_err "配置文件写入失败。"
+        rollback_config_transaction || true
         return 1
     fi
     rm -f "$config_tmp"
     if ! printf '%s\n' "$REMARKS" > "$REMARKS_FILE" || \
-        ! chown root:"$SERVICE_USER" "$REMARKS_FILE" || \
+        ! chown root:"$SERVICE_GROUP" "$REMARKS_FILE" || \
         ! chmod 0640 "$REMARKS_FILE"; then
         print_err "备注文件写入失败。"
+        rollback_config_transaction || true
         return 1
     fi
 
     # 6. 写入并校验服务文件
     if ! write_service_file; then
         print_err "systemd 服务文件写入失败。"
+        rollback_config_transaction || true
         return 1
     fi
     if command -v systemd-analyze >/dev/null 2>&1 && \
         ! systemd-analyze verify "$SERVICE_FILE"; then
         print_err "systemd 服务文件校验失败。"
+        rollback_config_transaction || true
         return 1
     fi
 
     if ! systemctl daemon-reload; then
         print_err "systemd 配置重载失败。"
+        rollback_config_transaction || true
         return 1
     fi
     systemctl reset-failed shadowsocks-rust 2>/dev/null || true
@@ -425,15 +696,19 @@ configure_ss() {
         ! systemctl restart shadowsocks-rust; then
         print_err "服务启动失败，最近日志如下："
         journalctl -u shadowsocks-rust --no-pager -n 20
+        rollback_config_transaction || true
         return 1
     fi
 
-    if systemctl is-active --quiet shadowsocks-rust; then
+    if check_service_health; then
+        commit_config_transaction
+        commit_core_update
         print_ok "服务启动成功！"
         show_info
     else
         print_err "服务启动失败！请查看日志。"
         journalctl -u shadowsocks-rust --no-pager -n 20
+        rollback_config_transaction || true
         return 1
     fi
 }
@@ -510,7 +785,7 @@ check_bbr() {
     echo -e "当前 TCP 拥塞控制: ${GREEN}${current_algo}${PLAIN}"
 
     if [[ "$current_algo" != "bbr" ]]; then
-        IFS= read -r -p "检测到未开启 BBR，是否尝试自动开启? (y/n): " enable_bbr
+        prompt_input enable_bbr "检测到未开启 BBR，是否尝试自动开启? (y/n): " || return 130
         if [[ "$enable_bbr" =~ ^[Yy]$ ]]; then
             modprobe tcp_bbr 2>/dev/null || true
             if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
@@ -519,11 +794,15 @@ check_bbr() {
             fi
 
             bbr_config="/etc/sysctl.d/99-shadowsocks-rust-bbr.conf"
-            cat > "$bbr_config" <<'EOF'
+            if ! cat > "$bbr_config" <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-            if sysctl --system >/dev/null && \
+            then
+                print_err "无法写入 BBR 配置文件。"
+                return 1
+            fi
+            if sysctl -p "$bbr_config" >/dev/null && \
                 [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
                 print_ok "BBR 已开启。"
             else
@@ -569,12 +848,14 @@ menu() {
     echo -e "  ${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${BLUE}#############################################################${PLAIN}"
     
-    IFS= read -r -p " 请选择操作 [0-9]: " CHOICE || exit 0
+    prompt_input CHOICE " 请选择操作 [0-9]: " || exit 0
     
     case $CHOICE in
         1)
             if install_deps && sync_time && install_core; then
-                configure_ss
+                if ! configure_ss; then
+                    rollback_core_update || true
+                fi
             else
                 print_err "安装已中止；未写入或启动无效的 systemd 服务。"
             fi
@@ -584,13 +865,24 @@ menu() {
                 if [[ -f "$SERVICE_FILE" ]]; then
                     systemctl reset-failed shadowsocks-rust 2>/dev/null || true
                     if systemctl restart shadowsocks-rust && \
-                        systemctl is-active --quiet shadowsocks-rust; then
+                        check_service_health; then
+                        commit_core_update
                         print_ok "内核更新完成，服务已重启。"
                     else
-                        print_err "内核已更新，但服务重启失败。"
+                        print_err "新内核健康检查失败，正在自动回滚。"
                         journalctl -u shadowsocks-rust --no-pager -n 20
+                        if rollback_core_update; then
+                            systemctl reset-failed shadowsocks-rust 2>/dev/null || true
+                            if systemctl restart shadowsocks-rust && check_service_health; then
+                                print_warn "旧内核已恢复，服务重新运行。"
+                            else
+                                print_err "旧内核恢复后服务仍未正常运行，请检查日志。"
+                                journalctl -u shadowsocks-rust --no-pager -n 20
+                            fi
+                        fi
                     fi
                 else
+                    commit_core_update
                     print_ok "内核更新完成；尚未配置 systemd 服务。"
                 fi
             else
@@ -600,7 +892,7 @@ menu() {
         3) show_info ;;
         4)
             systemctl reset-failed shadowsocks-rust 2>/dev/null || true
-            if systemctl start shadowsocks-rust && systemctl is-active --quiet shadowsocks-rust; then
+            if systemctl start shadowsocks-rust && check_service_health; then
                 print_ok "服务已启动"
             else
                 print_err "服务启动失败"
@@ -610,7 +902,7 @@ menu() {
         5) systemctl stop shadowsocks-rust && print_ok "服务已停止" ;;
         6)
             systemctl reset-failed shadowsocks-rust 2>/dev/null || true
-            if systemctl restart shadowsocks-rust && systemctl is-active --quiet shadowsocks-rust; then
+            if systemctl restart shadowsocks-rust && check_service_health; then
                 print_ok "服务已重启"
             else
                 print_err "服务重启失败"
@@ -620,17 +912,17 @@ menu() {
         7) echo -e "${YELLOW}按 Ctrl+C 退出日志查看${PLAIN}"; journalctl -u shadowsocks-rust -f ;;
         8) check_bbr ;;
         9)
-            IFS= read -r -p "确认要卸载吗? (y/n): " CONFIRM
+            prompt_input CONFIRM "确认要卸载吗? (y/n): " || return 130
             if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
                 systemctl disable --now shadowsocks-rust >/dev/null 2>&1 || true
-                rm -f "$SERVICE_FILE" "$BIN_PATH"
-                rm -rf /etc/shadowsocks-rust
-                if id "$SERVICE_USER" >/dev/null 2>&1; then
-                    userdel "$SERVICE_USER" 2>/dev/null || true
-                fi
+                rm -f "$SERVICE_FILE" "$BIN_PATH" "${BIN_PATH}.new" "$CORE_BACKUP_PATH"
+                rm -rf "$CONFIG_DIR"
+                remove_managed_service_identity || true
                 systemctl daemon-reload
                 systemctl reset-failed shadowsocks-rust 2>/dev/null || true
                 print_ok "卸载完成。"
+                [[ -f /etc/sysctl.d/99-shadowsocks-rust-bbr.conf ]] && \
+                    print_info "已保留系统级 BBR 配置，如不需要可手动删除。"
             fi
             ;;
         0) exit 0 ;;
@@ -639,8 +931,18 @@ menu() {
 }
 
 # --- 入口 ---
-while true; do
-    menu
-    echo -e "\n${YELLOW}按回车键返回主菜单...${PLAIN}"
-    IFS= read -r || exit 0
-done
+main() {
+    preflight || exit 1
+    trap handle_exit EXIT
+    trap 'exit 130' INT TERM
+
+    while true; do
+        menu
+        echo -e "\n${YELLOW}按回车键返回主菜单...${PLAIN}"
+        IFS= read -r || exit 0
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
