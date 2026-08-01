@@ -582,6 +582,7 @@ menu() {
         2)
             if install_deps && install_core; then
                 if [[ -f "$SERVICE_FILE" ]]; then
+                    systemctl reset-failed shadowsocks-rust 2>/dev/null || true
                     if systemctl restart shadowsocks-rust && \
                         systemctl is-active --quiet shadowsocks-rust; then
                         print_ok "内核更新完成，服务已重启。"
@@ -598,6 +599,7 @@ menu() {
             ;;
         3) show_info ;;
         4)
+            systemctl reset-failed shadowsocks-rust 2>/dev/null || true
             if systemctl start shadowsocks-rust && systemctl is-active --quiet shadowsocks-rust; then
                 print_ok "服务已启动"
             else
@@ -607,6 +609,7 @@ menu() {
             ;;
         5) systemctl stop shadowsocks-rust && print_ok "服务已停止" ;;
         6)
+            systemctl reset-failed shadowsocks-rust 2>/dev/null || true
             if systemctl restart shadowsocks-rust && systemctl is-active --quiet shadowsocks-rust; then
                 print_ok "服务已重启"
             else
