@@ -561,6 +561,128 @@ check_service_health() {
     print_ok "健康检查通过：systemd 稳定，端口 $port 与配置一致。"
 }
 
+# --- 终端信息框渲染 ---
+terminal_display_width() {
+    local text=$1 width
+
+    if width=$(printf '%s\n' "$text" | LC_ALL=C.UTF-8 wc -L 2>/dev/null); then
+        printf '%s' "$width"
+    else
+        # Debian/Ubuntu 通常自带 C.UTF-8；极少数精简系统缺失时退回字符数。
+        printf '%s' "${#text}"
+    fi
+}
+
+sanitize_terminal_text() {
+    local text=$1
+
+    text=${text//$'\e'/\\e}
+    text=${text//$'\n'/\\n}
+    text=${text//$'\r'/\\r}
+    text=${text//$'\t'/\\t}
+    printf '%s' "$text" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+}
+
+print_connection_box_border() {
+    local position=$1 left middle right
+
+    printf -v middle '%*s' "$((INFO_BOX_CONTENT_WIDTH + 2))" ''
+    middle=${middle// /═}
+    case "$position" in
+        top) left="╔"; right="╗" ;;
+        middle) left="╠"; right="╣" ;;
+        bottom) left="╚"; right="╝" ;;
+        *) return 1 ;;
+    esac
+    printf '%b%s%s%s%b\n' "$BLUE" "$left" "$middle" "$right" "$PLAIN"
+}
+
+print_connection_box_line() {
+    local text=$1 alignment=${2:-left} color=${3:-$GREEN}
+    local text_width left_padding=0 right_padding
+
+    text_width=$(terminal_display_width "$text")
+    (( text_width > INFO_BOX_CONTENT_WIDTH )) && return 1
+    right_padding=$((INFO_BOX_CONTENT_WIDTH - text_width))
+    if [[ "$alignment" == "center" ]]; then
+        left_padding=$((right_padding / 2))
+        right_padding=$((right_padding - left_padding))
+    fi
+
+    printf '%b║%b %*s%b%s%b%*s %b║%b\n' \
+        "$BLUE" "$PLAIN" "$left_padding" '' "$color" "$text" "$PLAIN" \
+        "$right_padding" '' "$BLUE" "$PLAIN"
+}
+
+print_connection_box_field() {
+    local label value prefix continuation current char
+    local prefix_width current_width char_width
+
+    label=$(sanitize_terminal_text "$1")
+    value=$(sanitize_terminal_text "$2")
+    prefix="$label: "
+    prefix_width=$(terminal_display_width "$prefix")
+    if (( prefix_width >= INFO_BOX_CONTENT_WIDTH )); then
+        print_connection_box_line "$label" || return 1
+        prefix=""
+        prefix_width=0
+    fi
+    printf -v continuation '%*s' "$prefix_width" ''
+    current=$prefix
+    current_width=$prefix_width
+
+    while IFS= read -r char; do
+        char_width=$(terminal_display_width "$char")
+        if (( current_width + char_width > INFO_BOX_CONTENT_WIDTH )); then
+            print_connection_box_line "$current" || return 1
+            current="$continuation$char"
+            current_width=$((prefix_width + char_width))
+        else
+            current+=$char
+            current_width=$((current_width + char_width))
+        fi
+    done < <(jq -nr --arg value "$value" '$value | explode[] | [.] | implode')
+
+    print_connection_box_line "$current"
+}
+
+get_status_plain() {
+    if [[ ! -x "$BIN_PATH" ]]; then
+        printf '内核未安装 (Not installed)'
+    elif systemctl is-active --quiet shadowsocks-rust; then
+        printf '运行中 (Running)'
+    else
+        printf '未运行 (Stopped)'
+    fi
+}
+
+render_connection_box() {
+    local ip=$1 port=$2 password=$3 method=$4 status=$5
+    local terminal_cols=${COLUMNS:-}
+
+    if [[ ! "$terminal_cols" =~ ^[0-9]+$ ]] && command -v tput >/dev/null 2>&1; then
+        terminal_cols=$(tput cols 2>/dev/null || true)
+    fi
+    [[ "$terminal_cols" =~ ^[0-9]+$ ]] || terminal_cols=80
+
+    INFO_BOX_CONTENT_WIDTH=68
+    if (( terminal_cols - 4 < INFO_BOX_CONTENT_WIDTH )); then
+        INFO_BOX_CONTENT_WIDTH=$((terminal_cols - 4))
+    fi
+    # 再窄的终端无法完整显示标题，保持一个仍可阅读的最小宽度。
+    (( INFO_BOX_CONTENT_WIDTH < 30 )) && INFO_BOX_CONTENT_WIDTH=30
+
+    print_connection_box_border top
+    print_connection_box_line "Shadowsocks-Rust 连接信息" center "$PURPLE"
+    print_connection_box_border middle
+    print_connection_box_field "地址 (IP)" "$ip"
+    print_connection_box_field "端口 (Port)" "$port"
+    print_connection_box_field "密码 (Pass)" "$password"
+    print_connection_box_field "加密 (Method)" "$method"
+    print_connection_box_field "状态 (Status)" "$status"
+    print_connection_box_border bottom
+}
+
 # --- 配置 SS ---
 configure_ss() {
     local current_port="" config_tmp listen_addr="::"
@@ -715,7 +837,7 @@ configure_ss() {
 
 # --- 展示信息 ---
 show_info() {
-    local port password method remarks ip host user_info remarks_encoded ss_link
+    local port password method remarks ip host user_info remarks_encoded ss_link status
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
         print_err "未找到配置文件！"
@@ -752,17 +874,10 @@ show_info() {
     user_info=$(printf '%s:%s' "$method" "$password" | base64 | tr -d '\n=' | tr '+/' '-_')
     remarks_encoded=$(jq -rn --arg value "$remarks" '$value | @uri')
     ss_link="ss://${user_info}@${host}:${port}#${remarks_encoded}"
+    status=$(get_status_plain)
 
     echo ""
-    echo -e "${BLUE}╔═══════════════════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${BLUE}║                 Shadowsocks-Rust 连接信息                 ║${PLAIN}"
-    echo -e "${BLUE}╠═══════════════════════════════════════════════════════════╣${PLAIN}"
-    echo -e "${BLUE}║${PLAIN}  地址 (IP)     : ${GREEN}${ip}${PLAIN}"
-    echo -e "${BLUE}║${PLAIN}  端口 (Port)   : ${GREEN}${port}${PLAIN}"
-    echo -e "${BLUE}║${PLAIN}  密码 (Pass)   : ${GREEN}${password}${PLAIN}"
-    echo -e "${BLUE}║${PLAIN}  加密 (Method) : ${GREEN}${method}${PLAIN}"
-    echo -e "${BLUE}║${PLAIN}  状态 (Status) : $(get_status)"
-    echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${PLAIN}"
+    render_connection_box "$ip" "$port" "$password" "$method" "$status"
     echo ""
     echo -e "SS 链接 (点击复制):"
     echo -e "${PURPLE}$ss_link${PLAIN}"

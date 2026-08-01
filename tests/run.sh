@@ -47,6 +47,32 @@ test_prompt_rejects_eof() {
     ! prompt_input answer "" </dev/null >/dev/null
 }
 
+test_connection_box_wraps_long_password() {
+    local output password line line_width line_count=0 password_chars
+
+    printf -v password '%160s' ''
+    password=${password// /Z}
+    BLUE=""
+    GREEN=""
+    PURPLE=""
+    PLAIN=""
+    COLUMNS=72
+    output=$(render_connection_box \
+        "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff" \
+        "65535" "$password" "2022-blake3-aes-256-gcm" "运行中 (Running)")
+
+    while IFS= read -r line; do
+        line_width=$(terminal_display_width "$line")
+        (( line_width == COLUMNS )) || return 1
+        [[ "$line" == ╔*╗ || "$line" == ╠*╣ || \
+            "$line" == ╚*╝ || "$line" == ║*║ ]] || return 1
+        line_count=$((line_count + 1))
+    done <<< "$output"
+    password_chars=$(printf '%s' "$output" | tr -cd 'Z' | wc -c)
+
+    (( line_count > 8 && password_chars == 160 ))
+}
+
 mock_release_curl() {
     local output=""
 
@@ -232,6 +258,7 @@ run_test "architecture mapping" test_arch_mapping
 run_test "unknown architecture rejection" test_arch_rejects_unknown
 run_test "SS2022 password validation" test_2022_password_validation
 run_test "EOF cancels prompts" test_prompt_rejects_eof
+run_test "connection box wraps long passwords" test_connection_box_wraps_long_password
 run_test "extract failure preserves installed core" test_extract_failure_preserves_core
 run_test "core update can roll back" test_core_rollback
 run_test "health check verifies TCP and UDP" test_health_checks_tcp_and_udp
