@@ -622,7 +622,9 @@ menu() {
                 systemctl disable --now shadowsocks-rust >/dev/null 2>&1 || true
                 rm -f "$SERVICE_FILE" "$BIN_PATH"
                 rm -rf /etc/shadowsocks-rust
-                id "$SERVICE_USER" >/dev/null 2>&1 && userdel "$SERVICE_USER" 2>/dev/null || true
+                if id "$SERVICE_USER" >/dev/null 2>&1; then
+                    userdel "$SERVICE_USER" 2>/dev/null || true
+                fi
                 systemctl daemon-reload
                 systemctl reset-failed shadowsocks-rust 2>/dev/null || true
                 print_ok "卸载完成。"
